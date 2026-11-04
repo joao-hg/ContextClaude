@@ -9,7 +9,7 @@ from unittest import mock
 from contextclaude import chibi_status, db, lock, notes, pipeline
 from contextclaude.ollama import ExtractionError
 
-DATA = {"fatos": ["f"], "decisoes": ["usar sqlite"], "pendencias": ["p"],
+DATA = {"fatos": ["f"], "decisoes": ["usar sqlite"], "feitos": ["fizemos x"], "titulo": "Sessão de teste",
         "relacoes": [{"origem": "A", "relacao": "usa", "destino": "B"}], "resumo": "r"}
 
 
@@ -54,8 +54,94 @@ class TestPipeline(unittest.TestCase):
         self.assertEqual(self.run_q(), 1)
         self.assertEqual(len(list((notes._dir("app") / "Sessões").glob("*.md"))), 1)
         self.assertEqual(notes.read_summary("app"), "RESUMO")
-        self.assertEqual(self.count("facts"), 3)
+        self.assertEqual(self.count("facts"), 2)
         self.assertEqual(self.count("relations"), 1)
+
+    def test_single_chunk_session_gets_title_without_extra_llm_call(self):
+        self.transcript("decidimos usar sqlite")
+        db.enqueue(self.conn, "s1", r"C:\dev\app", self.tpath)
+        consolidate = mock.Mock(side_effect=AssertionError("não devia chamar"))
+        pipeline.process_queue(self.conn, extract=self.extract, merge=lambda o, d: "R", now=now,
+                               consolidate=consolidate)
+        row = self.conn.execute("SELECT title, summary, feitos, draft, note_path FROM sessions").fetchone()
+        self.assertEqual((row["title"], row["summary"], row["draft"]), ("Sessão de teste", "r", None))
+        self.assertEqual(json.loads(row["feitos"]), ["fizemos x"])
+        self.assertTrue(row["note_path"].endswith("Sessão de teste.md"))
+        self.assertTrue(notes.context_path("app").is_file())
+
+    def test_multi_chunk_session_is_consolidated_once(self):
+        self.transcript("primeiro bloco", "segundo bloco")
+        db.enqueue(self.conn, "s1", r"C:\dev\app", self.tpath)
+        consolidate = mock.Mock(return_value={"titulo": "Título final", "resumo": "R", "feitos": ["a", "b"]})
+        with mock.patch.object(pipeline, "CHUNK_CHARS", 10):
+            pipeline.process_queue(self.conn, extract=self.extract, merge=lambda o, d: "R", now=now,
+                                   consolidate=consolidate)
+        self.assertEqual(consolidate.call_count, 1)
+        current, draft = consolidate.call_args[0]
+        self.assertEqual(current["titulo"], "")
+        self.assertEqual(draft["resumos"], ["r", "r"])
+        self.assertEqual(draft["feitos"], ["fizemos x"])
+        files = [p.name[11:] for p in (notes._dir("app") / "Sessões").glob("*.md")]
+        self.assertEqual(files, ["Título final.md"])  # prefixo = data da sessão (sessions.created_at)
+
+    def test_consolidation_failure_keeps_draft_and_still_writes_note(self):
+        self.transcript("primeiro bloco", "segundo bloco")
+        db.enqueue(self.conn, "s1", r"C:\dev\app", self.tpath)
+        with mock.patch.object(pipeline, "CHUNK_CHARS", 10):
+            pipeline.process_queue(self.conn, extract=self.extract, merge=lambda o, d: "R", now=now,
+                                   consolidate=mock.Mock(side_effect=TimeoutError("lento")))
+        row = self.conn.execute("SELECT status, title, draft FROM sessions").fetchone()
+        self.assertEqual((row["status"], row["title"]), ("done", None))
+        self.assertEqual(json.loads(row["draft"])["resumos"], ["r", "r"])
+        files = [p.name[11:] for p in (notes._dir("app") / "Sessões").glob("*.md")]
+        self.assertEqual(files, ["Sessão de teste.md"])  # prefixo = data da sessão (sessions.created_at)
+
+    def test_failed_session_does_not_call_consolidation(self):
+        self.transcript("primeiro bloco", "segundo bloco")
+        db.enqueue(self.conn, "s1", r"C:\dev\app", self.tpath)
+        calls = []
+
+        def fail_second(lines):
+            calls.append(lines)
+            if len(calls) == 2:
+                raise RuntimeError("ollama 500")
+            return dict(DATA)
+
+        consolidate = mock.Mock(side_effect=AssertionError("não devia chamar"))
+        with mock.patch.object(pipeline, "CHUNK_CHARS", 10):
+            pipeline.process_queue(self.conn, extract=fail_second, merge=lambda o, d: "R", now=now,
+                                   consolidate=consolidate)
+        self.assertEqual(json.loads(self.conn.execute("SELECT draft FROM sessions").fetchone()[0])["resumos"], ["r"])
+
+    def test_first_consolidation_includes_legacy_note_resumo(self):
+        legacy = notes._dir("app") / "Sessões" / "2026-10-28-0900.md"
+        legacy.parent.mkdir(parents=True)
+        legacy.write_text("---\nprojeto: app\nsessao: s1\n---\n\n## Resumo\nantes\n\n## Fatos\n- f\n", encoding="utf-8")
+        self.transcript("decidimos usar sqlite")
+        db.enqueue(self.conn, "s1", "C:/dev/app", self.tpath)
+        consolidate = mock.Mock(return_value={"titulo": "T", "resumo": "R", "feitos": []})
+        pipeline.process_queue(self.conn, extract=self.extract, merge=lambda o, d: "R", now=now,
+                               consolidate=consolidate)
+        self.assertEqual(consolidate.call_args[0][1]["resumos"], ["antes", "r"])
+        self.assertFalse(legacy.exists())
+
+    def test_backfill_rebuilds_old_sessions_from_stored_facts(self):
+        db.enqueue(self.conn, "s1", r"C:\dev\app", self.tpath)
+        self.conn.execute("INSERT INTO facts(session_id, project, kind, text) VALUES('s1','app','decisao','usar sqlite')")
+        self.conn.commit()
+        consolidate = mock.Mock(return_value={"titulo": "Antiga", "resumo": "R", "feitos": ["a"]})
+        merge = mock.Mock(return_value="RESUMO NOVO")
+        notes.write_summary("app", "Okay, let's tackle this. lixo antigo")
+        self.assertEqual(pipeline.backfill_records(self.conn, consolidate=consolidate, merge=merge,
+                                                   out=lambda *_: None), 1)
+        self.assertEqual(consolidate.call_args[0][1]["decisoes"], ["usar sqlite"])
+        self.assertEqual(merge.call_args[0], ("", {"decisoes": ["usar sqlite"], "resumo": "Antiga: R"}))
+        self.assertEqual(notes.read_summary("app"), "RESUMO NOVO")
+        self.assertIn("RESUMO NOVO", notes.context_path("app").read_text(encoding="utf-8"))
+        self.assertEqual(self.conn.execute("SELECT title FROM sessions").fetchone()[0], "Antiga")
+        # já tem título: sem --todas não refaz
+        self.assertEqual(pipeline.backfill_records(self.conn, consolidate=consolidate, merge=merge,
+                                                   out=lambda *_: None), 0)
 
     def test_process_one_runs_merge_and_conflict_search_before_first_write(self):
         """I2: o resumo (merge, chamada lenta ao Ollama) e a busca de conflito de decisão
@@ -82,7 +168,141 @@ class TestPipeline(unittest.TestCase):
              mock.patch.object(pipeline, "_save", tracking_save):
             pipeline.process_queue(self.conn, extract=self.extract, merge=merge, now=now)
 
-        self.assertEqual(order, ["search", "merge", "save"])
+        # busca de conflito antes do write; merge só no fim da rodada, depois do commit
+        self.assertEqual(order, ["search", "save", "merge"])
+
+    def test_timeout_on_big_chunk_splits_instead_of_failing(self):
+        self.transcript("a" * 2000, "b" * 2000)
+        db.enqueue(self.conn, "s1", r"C:\dev\app", self.tpath)
+
+        def slow_when_big(lines):
+            if len(lines) > 1:
+                raise TimeoutError("timed out")
+            return dict(DATA)
+
+        self.run_q(slow_when_big)
+        self.assertEqual(self.status(), "done")
+        self.assertEqual(self.count("facts"), 2)
+
+    def test_timeout_on_small_chunk_fails_session(self):
+        self.transcript("curto")
+        db.enqueue(self.conn, "s1", r"C:\dev\app", self.tpath)
+
+        def slow(lines):
+            raise TimeoutError("timed out")
+
+        self.run_q(slow)
+        row = self.conn.execute("SELECT status, attempts, offset FROM sessions").fetchone()
+        self.assertEqual((row["status"], row["attempts"], row["offset"]), ("queued", 1, 0))
+
+    def test_progress_is_checkpointed_per_chunk(self):
+        """Falha no 2º bloco mantém fatos e offset do 1º; a nova tentativa só manda o 2º."""
+        self.transcript("primeiro bloco", "segundo bloco")
+        db.enqueue(self.conn, "s1", r"C:\dev\app", self.tpath)
+        calls = []
+
+        def fail_second(lines):
+            calls.append(lines)
+            if len(calls) == 2:
+                raise RuntimeError("ollama 500")
+            return dict(DATA)
+
+        with mock.patch.object(pipeline, "CHUNK_CHARS", 10):
+            self.run_q(fail_second)
+            row = self.conn.execute("SELECT status, attempts, offset FROM sessions").fetchone()
+            self.assertEqual((row["status"], row["attempts"]), ("queued", 1))
+            self.assertGreater(row["offset"], 0)
+            self.assertLess(row["offset"], os.path.getsize(self.tpath))
+            self.assertEqual(self.count("facts"), 2)
+            self.captured.clear()
+            self.run_q()
+        self.assertEqual(self.status(), "done")
+        self.assertEqual(len(self.captured), 1)
+        self.assertIn("segundo bloco", self.captured[0])
+
+    def test_timeout_splits_only_once(self):
+        """Timeout repetido não reparte em cascata (cada espera custa o timeout inteiro)."""
+        self.transcript("a" * 2000, "b" * 2000, "c" * 2000, "d" * 2000)
+        db.enqueue(self.conn, "s1", r"C:\dev\app", self.tpath)
+        calls = []
+
+        def slow(lines):
+            calls.append(len(lines))
+            raise TimeoutError("timed out")
+
+        self.run_q(slow)
+        self.assertEqual(calls, [4, 2])  # bloco inteiro, depois a 1ª metade; propaga
+        self.assertEqual(self.status(), "queued")
+
+    def test_progress_resets_attempts_on_failure(self):
+        """Sessão que avança blocos e falha adiante não esgota as tentativas."""
+        self.transcript("primeiro bloco", "segundo bloco")
+        db.enqueue(self.conn, "s1", r"C:\dev\app", self.tpath)
+        self.conn.execute("UPDATE sessions SET attempts=4")
+        self.conn.commit()
+        calls = []
+
+        def fail_second(lines):
+            calls.append(lines)
+            if len(calls) == 2:
+                raise RuntimeError("ollama 500")
+            return dict(DATA)
+
+        with mock.patch.object(pipeline, "CHUNK_CHARS", 10):
+            self.run_q(fail_second)
+        row = self.conn.execute("SELECT status, attempts FROM sessions").fetchone()
+        self.assertEqual((row["status"], row["attempts"]), ("queued", 1))
+
+    def test_path_switch_mid_session_keeps_new_path_offset(self):
+        """Hook troca o JSONL (retomada em worktree) enquanto o worker processa o antigo:
+        o checkpoint não grava o offset do arquivo antigo sobre o novo."""
+        p2 = os.path.join(self.tmp.name, "t2.jsonl")
+        with open(p2, "w", encoding="utf-8", newline="\n") as f:
+            f.write(json.dumps({"type": "user", "message": {"role": "user", "content": "novo"}}) + "\n")
+        self.transcript("primeiro bloco", "segundo bloco")
+        db.enqueue(self.conn, "s1", r"C:\dev\app", self.tpath)
+        other = db.connect()
+        calls = []
+
+        def switch(lines):
+            calls.append(lines)
+            if len(calls) == 1:
+                db.enqueue(other, "s1", r"C:\dev\app", p2)
+            return dict(DATA)
+
+        with mock.patch.object(pipeline, "CHUNK_CHARS", 10):
+            self.run_q(switch)
+        other.close()
+        row = self.conn.execute("SELECT transcript_path, offset, status FROM sessions").fetchone()
+        self.assertEqual(row["transcript_path"], p2)
+        self.assertEqual(row["offset"], os.path.getsize(p2))  # o novo foi lido do início até o fim
+        self.assertTrue(any("novo" in l for c in calls for l in c))
+
+    def test_merge_failure_keeps_old_summary_intact(self):
+        self.transcript("x")
+        db.enqueue(self.conn, "s1", r"C:\dev\app", self.tpath)
+        old = "## Estado\n" + "o" * 1300
+        notes.write_summary("app", old)
+
+        def boom(o, d):
+            raise TimeoutError("timed out")
+
+        big = {**DATA, "resumo": "n" * 3000}
+        pipeline.process_queue(self.conn, extract=lambda l: dict(big), merge=boom, now=now)
+        self.assertTrue(notes.read_summary("app").startswith(old))
+
+    def test_summary_merged_once_per_project_per_round(self):
+        p2 = os.path.join(self.tmp.name, "t2.jsonl")
+        self.transcript("sessao um")
+        with open(p2, "w", encoding="utf-8", newline="\n") as f:
+            f.write(json.dumps({"type": "user", "message": {"role": "user", "content": "sessao dois"}}) + "\n")
+        db.enqueue(self.conn, "s1", r"C:\dev\app", self.tpath)
+        db.enqueue(self.conn, "s2", r"C:\dev\app", p2)
+        merges = []
+        pipeline.process_queue(self.conn, extract=self.extract,
+                               merge=lambda old, d: merges.append(d) or "RESUMO", now=now)
+        self.assertEqual(len(merges), 1)
+        self.assertEqual(notes.read_summary("app"), "RESUMO")
 
     def test_unrecoverable_line_is_discarded_not_retried_forever(self):
         """Uma linha que nunca produz JSON válido (mesmo sozinha) é descartada: a
@@ -111,7 +331,7 @@ class TestPipeline(unittest.TestCase):
 
         self.assertEqual(self.run_q(picky), 1)
         self.assertEqual(self.status(), "done")
-        self.assertEqual(self.count("facts"), 3)
+        self.assertEqual(self.count("facts"), 2)
 
     def test_truncated_json_retries_with_smaller_chunks(self):
         self.transcript("um", "dois", "tres", "quatro")
@@ -124,7 +344,7 @@ class TestPipeline(unittest.TestCase):
 
         self.assertEqual(self.run_q(flaky), 1)
         self.assertEqual(self.status(), "done")
-        self.assertEqual(self.count("facts"), 3)
+        self.assertEqual(self.count("facts"), 2)
         self.assertEqual(self.count("relations"), 1)
 
     def test_ollama_down_does_not_burn_attempts(self):
@@ -157,11 +377,11 @@ class TestPipeline(unittest.TestCase):
         db.enqueue(self.conn, "s1", r"C:\dev\app", self.tpath)
         self.run_q()
         self.run_q()
-        self.assertEqual(self.count("facts"), 3)
+        self.assertEqual(self.count("facts"), 2)
         self.transcript("dois", mode="a")
         self.run_q()
-        # fato "f", pendencia "p" e decisao "usar sqlite" são duplicatas exatas (não reinseridas)
-        self.assertEqual(self.count("facts"), 3)
+        # fato "f" e decisao "usar sqlite" são duplicatas exatas (não reinseridas)
+        self.assertEqual(self.count("facts"), 2)
 
     def test_home_cwd_goes_to_geral(self):
         self.transcript("x")
@@ -176,23 +396,17 @@ class TestPipeline(unittest.TestCase):
         self.assertTrue((notes._dir("app") / "Entidades" / "a.md").exists())
         self.assertTrue((notes._dir("app") / "Entidades" / "b.md").exists())
 
-    def test_failure_in_graph_write_entities_does_not_advance_offset(self):
+    def test_failure_in_graph_write_entities_keeps_facts_and_finishes(self):
+        """Páginas de entidade são derivadas do SQLite (`cc.py vault` as refaz): falha nelas
+        só é registrada no log, sem refazer a extração."""
         self.transcript("decidimos usar sqlite")
         db.enqueue(self.conn, "s1", r"C:\dev\app", self.tpath)
-        def boom(*a, **kw):
-            raise RuntimeError("falha simulada")
-        with mock.patch("contextclaude.pipeline.graph.write_entities", side_effect=boom):
+        with mock.patch("contextclaude.pipeline.graph.write_entities", side_effect=RuntimeError("falha simulada")):
             self.run_q()
         row = self.conn.execute("SELECT status, offset FROM sessions").fetchone()
-        self.assertEqual(row["status"], "queued")
-        self.assertEqual(row["offset"], 0)  # nada consumido: a sessão inteira será reprocessada
-        self.assertEqual(self.count("facts"), 0)  # fatos da tentativa falha não ficaram presos
-        # segunda rodada, sem a falha: desta vez tudo deve completar, incluindo o grafo
-        self.run_q()
-        row = self.conn.execute("SELECT status, offset FROM sessions").fetchone()
         self.assertEqual(row["status"], "done")
-        self.assertGreater(row["offset"], 0)
-        self.assertEqual(self.count("facts"), 3)  # DATA fixture produz 1 fato + 1 decisao + 1 pendencia
+        self.assertEqual(row["offset"], os.path.getsize(self.tpath))
+        self.assertEqual(self.count("facts"), 2)
 
     def test_worker_lock_blocks_second_instance(self):
         first = lock.acquire()
@@ -444,7 +658,7 @@ class TestPipeline(unittest.TestCase):
 
     def test_save_skips_exact_duplicate_fato_text(self):
         row = {"session_id": "s1"}
-        data = {"fatos": ["usa sqlite"], "decisoes": [], "pendencias": [], "relacoes": [], "resumo": ""}
+        data = {"fatos": ["usa sqlite"], "decisoes": [], "feitos": [], "relacoes": [], "resumo": ""}
         pipeline._save(self.conn, row, "p", data, "2026-01-01T00:00:00")
         pipeline._save(self.conn, row, "p", data, "2026-01-01T00:00:01")
         self.conn.commit()
@@ -452,12 +666,12 @@ class TestPipeline(unittest.TestCase):
 
     def test_save_supersedes_conflicting_earlier_decision(self):
         row = {"session_id": "s1"}
-        data = {"fatos": [], "decisoes": ["usar sqlite"], "pendencias": [], "relacoes": [], "resumo": ""}
+        data = {"fatos": [], "decisoes": ["usar sqlite"], "feitos": [], "relacoes": [], "resumo": ""}
         pipeline._save(self.conn, row, "p", data, "2026-01-01T00:00:00", find_conflict=lambda project, text: None)
         old_id = self.conn.execute("SELECT id FROM facts WHERE kind='decisao'").fetchone()["id"]
 
         row2 = {"session_id": "s2"}
-        data2 = {"fatos": [], "decisoes": ["usar postgres"], "pendencias": [], "relacoes": [], "resumo": ""}
+        data2 = {"fatos": [], "decisoes": ["usar postgres"], "feitos": [], "relacoes": [], "resumo": ""}
         pipeline._save(self.conn, row2, "p", data2, "2026-01-02T00:00:00",
                        find_conflict=lambda project, text: old_id)
         self.conn.commit()
@@ -521,14 +735,14 @@ class TestPipeline(unittest.TestCase):
     def test_save_skips_find_conflict_for_blank_decision_text(self):
         calls = []
         row = {"session_id": "s1"}
-        data = {"fatos": [], "decisoes": ["   ", "usar sqlite"], "pendencias": [], "relacoes": [], "resumo": ""}
+        data = {"fatos": [], "decisoes": ["   ", "usar sqlite"], "feitos": [], "relacoes": [], "resumo": ""}
         pipeline._save(self.conn, row, "p", data, "2026-01-01T00:00:00",
                        find_conflict=lambda project, text: calls.append(text) or None)
         self.assertEqual(calls, ["usar sqlite"])  # a entrada em branco nunca chega ao find_conflict
 
     def test_save_does_not_duplicate_or_self_supersede_on_retry(self):
         row = {"session_id": "s1"}
-        data = {"fatos": [], "decisoes": ["usar sqlite"], "pendencias": [], "relacoes": [], "resumo": ""}
+        data = {"fatos": [], "decisoes": ["usar sqlite"], "feitos": [], "relacoes": [], "resumo": ""}
         pipeline._save(self.conn, row, "p", data, "2026-01-01T00:00:00", find_conflict=lambda project, text: None)
         pipeline._save(self.conn, row, "p", data, "2026-01-01T00:00:01", find_conflict=lambda project, text: None)
         self.conn.commit()
@@ -536,7 +750,7 @@ class TestPipeline(unittest.TestCase):
 
     def test_save_reinstates_decision_identical_to_a_superseded_one(self):
         row = {"session_id": "s1"}
-        data = {"fatos": [], "decisoes": ["usar sqlite"], "pendencias": [], "relacoes": [], "resumo": ""}
+        data = {"fatos": [], "decisoes": ["usar sqlite"], "feitos": [], "relacoes": [], "resumo": ""}
         pipeline._save(self.conn, row, "p", data, "2026-01-01T00:00:00", find_conflict=lambda project, text: None)
         old_id = self.conn.execute("SELECT id FROM facts WHERE kind='decisao'").fetchone()["id"]
         self.conn.execute("UPDATE facts SET status='substituida' WHERE id=?", (old_id,))

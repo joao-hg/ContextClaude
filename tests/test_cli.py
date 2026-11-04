@@ -111,6 +111,36 @@ class TestCli(unittest.TestCase):
         self.assertIn("O worker está rodando; tente de novo em instantes.", out)
 
 
+class TestRetomar(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        os.environ["CONTEXTCLAUDE_ROOT"] = self.tmp.name
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_retomar_requeues_error_session_by_prefix(self):
+        conn = db.connect()
+        db.enqueue(conn, "abc123-x", "c", "a.jsonl")
+        conn.execute("UPDATE sessions SET status='error', attempts=5, offset=40")
+        conn.commit()
+        out = []
+        self.assertEqual(cc.main(["retomar", "abc1"], out=out.append), 0)
+        r = conn.execute("SELECT status, attempts, offset FROM sessions").fetchone()
+        conn.close()
+        self.assertEqual(tuple(r), ("queued", 0, 40))
+        self.assertIn("abc123-x", out[0])
+
+    def test_retomar_unknown_or_ambiguous_returns_1(self):
+        conn = db.connect()
+        db.enqueue(conn, "ab1", "c", "a.jsonl")
+        db.enqueue(conn, "ab2", "c", "b.jsonl")
+        conn.close()
+        out = []
+        self.assertEqual(cc.main(["retomar", "zz"], out=out.append), 1)
+        self.assertEqual(cc.main(["retomar", "ab"], out=out.append), 1)
+
+
 class TestWorkerIndexing(unittest.TestCase):
     def test_index_failure_is_logged_not_raised(self):
         import worker
@@ -124,6 +154,53 @@ class TestWorkerIndexing(unittest.TestCase):
                 worker.main()
             self.assertTrue(any("indexação" in str(c) for c in log.call_args_list))
             vectors.close()
+
+
+class TestAppCommands(unittest.TestCase):
+    def test_app_subcommand_calls_main(self):
+        import app.main
+        with mock.patch.object(app.main, "main", return_value=0) as m:
+            self.assertEqual(cc.main(["app"], out=lambda *_: None), 0)
+        m.assert_called_once_with()
+
+    def test_app_and_atalho_failures_are_not_reported_as_index_failures(self):
+        import app.main
+        import app.shortcut
+        for cmd, mod, fn in (("app", app.main, "main"), ("atalho", app.shortcut, "create_shortcut")):
+            out = []
+            with mock.patch.object(mod, fn, side_effect=RuntimeError("x")):
+                self.assertEqual(cc.main([cmd], out=out.append), 1)
+            self.assertEqual(out, [f"Falha em {cmd}: RuntimeError('x')"])
+
+    def test_app_and_atalho_failures_are_logged_with_traceback(self):
+        """Sob pythonw não há console: a falha precisa ir para data/log.txt."""
+        import app.main
+        import app.shortcut
+        from contextclaude import config
+        for cmd, mod, fn in (("app", app.main, "main"), ("atalho", app.shortcut, "create_shortcut")):
+            with mock.patch.object(mod, fn, side_effect=RuntimeError(f"boom-{cmd}")):
+                self.assertEqual(cc.main([cmd], out=lambda *_: None), 1)
+            log = config.log_path().read_text(encoding="utf-8")
+            self.assertIn(f"Falha em {cmd}: RuntimeError('boom-{cmd}')", log)
+            self.assertIn("Traceback (most recent call last)", log)
+
+    def test_entrypoint_survives_stdout_none(self):
+        """pythonw: sys.stdout é None; o flush não pode impedir o os._exit(code)."""
+        import subprocess
+        cc_path = os.path.join(os.path.dirname(os.path.abspath(cc.__file__)), "cc.py")
+        code = ("import runpy, sys; sys.stdout = None; "
+                f"sys.argv = ['cc.py', 'buscar', 'x', '-n', '0']; runpy.run_path({cc_path!r}, run_name='__main__')")
+        r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=120)
+        self.assertEqual(r.stderr, "")
+        self.assertEqual(r.returncode, 1)
+
+    def test_atalho_subcommand_creates_start_menu_and_desktop(self):
+        import app.shortcut
+        out = []
+        with mock.patch.object(app.shortcut, "start_menu_dir", return_value="SM"),                 mock.patch.object(app.shortcut, "desktop_dir", return_value="DT"),                 mock.patch.object(app.shortcut, "create_shortcut", side_effect=lambda d: f"{d}/X.lnk") as m:
+            self.assertEqual(cc.main(["atalho"], out=out.append), 0)
+        self.assertEqual([c.args[0] for c in m.call_args_list], ["SM", "DT"])
+        self.assertEqual(out, ["SM/X.lnk", "DT/X.lnk"])
 
 
 if __name__ == "__main__":

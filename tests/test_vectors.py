@@ -102,3 +102,18 @@ class TestVectors(Base):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestChromaAsciiPath(unittest.TestCase):
+    def test_non_ascii_root_maps_to_ascii_short_path(self):
+        import tempfile
+        from pathlib import Path
+        from contextclaude import config
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "projeção" / "chroma"
+            out = config._ascii_path(p)
+            if out == p:
+                self.skipTest("nomes curtos 8.3 desativados neste volume")
+            self.assertTrue(str(out).isascii())
+            self.assertTrue(out.is_dir())
+            self.assertTrue(os.path.samefile(out, p))

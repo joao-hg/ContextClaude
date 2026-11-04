@@ -23,6 +23,22 @@ class TestTranscript(unittest.TestCase):
             for l in lines:
                 f.write(l + "\n")
 
+    def test_with_pos_gives_offset_after_each_kept_line(self):
+        a, junk, b = ev("user", "um"), json.dumps({"type": "attachment"}), ev("assistant", "dois")
+        self.write(a, junk, b)
+        items, off = read_new(self.path, 0, with_pos=True)
+        sz_a = len(a.encode()) + 1
+        self.assertEqual(items, [("Usuário: um", sz_a), ("Claude: dois", off)])
+        self.assertEqual(off, os.path.getsize(self.path))
+
+    def test_long_assistant_message_keeps_head_and_tail(self):
+        text = "INICIO" + "x" * 10000 + "FIM"
+        self.write(ev("assistant", text))
+        line = read_new(self.path, 0)[0][0]
+        self.assertTrue(line.startswith("Claude: INICIO"))
+        self.assertTrue(line.endswith("FIM"))
+        self.assertLess(len(line), 2100)
+
     def test_extracts_user_and_assistant_text(self):
         self.write(ev("user", "olá João"), ev("assistant", [{"type": "text", "text": "oi"}]))
         lines, off = read_new(self.path, 0)

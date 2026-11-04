@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src data:; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ContextClaude</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<div id="app">
+  <aside id="sidebar">
+    <div class="brand"><span class="icon" data-icon="folder"></span><span>ContextClaude</span></div>
+
+    <button id="new-chat" class="btn-primary btn-wide" type="button"><span class="icon" data-icon="plus"></span><span>Nova conversa</span></button>
+
+    <label class="search">
+      <span class="icon" data-icon="search"></span>
+      <input id="search" type="search" placeholder="Buscar" autocomplete="off" spellcheck="false">
+    </label>
+
+    <nav class="nav">
+      <button id="nav-memory" class="nav-item" type="button"><span class="icon" data-icon="doc"></span><span>Memória</span></button>
+      <button id="nav-files" class="nav-item" type="button"><span class="icon" data-icon="folder"></span><span>Arquivos</span></button>
+    </nav>
+
+    <div class="sidebar-scroll">
+      <section class="group">
+        <button id="projects-toggle" class="group-head" type="button" aria-expanded="true">
+          <span>Projetos</span><span class="icon chevron" data-icon="chevron-down"></span>
+        </button>
+        <ul id="projects" class="list"></ul>
+      </section>
+
+      <section class="group">
+        <div class="group-head static"><span>Recentes</span></div>
+        <ul id="recents" class="list"></ul>
+      </section>
+    </div>
+
+    <div class="chibi-row">
+      <div id="chibi" class="chibi" role="button" tabindex="0" title="Ver atividade" aria-label="Ver atividade"></div>
+      <div id="chibi-text" class="chibi-text"></div>
+    </div>
+    <ul id="activity-mini" class="activity-mini" aria-label="Atividade recente"></ul>
+
+    <div class="user-row">
+      <span class="avatar"><span class="icon" data-icon="user"></span></span>
+      <span class="user-name">João</span>
+      <button class="icon-btn" type="button" title="Configurações"><span class="icon" data-icon="gear"></span></button>
+    </div>
+  </aside>
+
+  <main id="main">
+    <header class="topbar">
+      <h1 id="title">Nova conversa</h1>
+      <div class="topbar-right">
+        <span id="ollama-pill" class="pill"><span class="dot"></span><span>Local · Ollama</span></span>
+        <button class="icon-btn" type="button" title="Mais"><span class="icon" data-icon="dots"></span></button>
+      </div>
+    </header>
+
+    <section id="chat-view" class="view">
+      <div id="messages" class="messages">
+        <div id="empty" class="empty">Pergunte sobre o que você fez nas sessões ou peça para organizar uma pasta.</div>
+      </div>
+    </section>
+
+    <section id="panel-view" class="view" hidden>
+      <div class="panel">
+        <div class="panel-head">
+          <h2 id="panel-title"></h2>
+          <button id="panel-close" class="btn-link" type="button">Voltar à conversa</button>
+        </div>
+        <div id="panel-body" class="panel-body"></div>
+      </div>
+    </section>
+
+    <footer class="composer-wrap">
+      <div class="composer">
+        <textarea id="input" rows="1" placeholder="Peça algo ao ContextClaude" spellcheck="false"></textarea>
+        <div class="composer-bar">
+          <label class="model-select">
+            <select id="model" aria-label="Modelo"></select>
+            <span class="icon chevron" data-icon="chevron-down"></span>
+          </label>
+          <span id="project-chip" class="chip" hidden></span>
+          <button id="send" class="send-btn" type="button" title="Enviar" disabled><span class="icon" data-icon="send"></span></button>
+        </div>
+      </div>
+      <div class="composer-foot">Processamento local no seu notebook</div>
+    </footer>
+  </main>
+</div>
+<script src="app.js"></script>
+</body>
+</html>

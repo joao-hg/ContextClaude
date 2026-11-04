@@ -25,6 +25,18 @@ CREATE TABLE IF NOT EXISTS chibi_rounds(
     status TEXT NOT NULL,
     mensagem TEXT
 );
+CREATE TABLE IF NOT EXISTS transcript_offsets(
+    session_id TEXT, path TEXT, offset INTEGER NOT NULL, PRIMARY KEY(session_id, path));
+CREATE TABLE IF NOT EXISTS conversations(
+    id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, created_at TEXT);
+CREATE TABLE IF NOT EXISTS messages(
+    id INTEGER PRIMARY KEY AUTOINCREMENT, conversation_id INTEGER NOT NULL,
+    role TEXT NOT NULL, content TEXT NOT NULL, created_at TEXT);
+CREATE INDEX IF NOT EXISTS idx_messages_conv ON messages(conversation_id);
+CREATE TABLE IF NOT EXISTS moves(
+    id INTEGER PRIMARY KEY AUTOINCREMENT, batch_id TEXT NOT NULL,
+    src TEXT NOT NULL, dst TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT);
+CREATE INDEX IF NOT EXISTS idx_moves_batch ON moves(batch_id);
 """
 
 
@@ -38,7 +50,26 @@ def connect(timeout: float = 10) -> sqlite3.Connection:
     _add_indexed_column(conn)
     _add_status_column(conn)
     _add_supersedes_column(conn)
+    for col in SESSION_COLUMNS:
+        _add_column(conn, "sessions", col, "TEXT")
     return conn
+
+
+# Registro da sessão para a nota: título/resumo/feitos consolidados pelo LLM; `draft` (JSON)
+# acumula o material dos blocos ainda não consolidado (sobrevive a queda do worker).
+SESSION_COLUMNS = ("title", "summary", "feitos", "draft", "note_path")
+
+
+def _add_column(conn, table: str, col: str, decl: str) -> None:
+    """Migração idempotente; outro processo pode ter adicionado a coluna entre a checagem e o ALTER."""
+    if col in [r[1] for r in conn.execute(f"PRAGMA table_info({table})")]:
+        return
+    try:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
+        conn.commit()
+    except sqlite3.OperationalError:
+        if col not in [r[1] for r in conn.execute(f"PRAGMA table_info({table})")]:
+            raise
 
 
 def _add_indexed_column(conn) -> None:
@@ -141,7 +172,46 @@ def active_fact_ids(conn, ids: list[int]) -> set[int]:
 
 
 def enqueue(conn, session_id: str, cwd: str, transcript_path: str) -> None:
-    """Idempotente: não rebaixa sessão já concluída; atualiza o caminho da transcrição."""
+    """Idempotente: não rebaixa sessão já concluída; atualiza o caminho da transcrição.
+
+    Uma sessão retomada em outra pasta (ex.: worktree) ganha um segundo JSONL com o mesmo
+    session_id, e os hooks alternam entre os dois caminhos. O offset de cada arquivo fica
+    guardado em transcript_offsets: voltar a um caminho já visto restaura o progresso dele
+    (antes, cada troca zerava offset e tentativas, num ciclo que nunca terminava).
+    BEGIN IMMEDIATE: leitura e escrita atômicas frente ao checkpoint do worker."""
+    if conn.in_transaction:
+        conn.commit()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        _enqueue(conn, session_id, cwd, transcript_path)
+    except BaseException:
+        conn.rollback()
+        raise
+    conn.commit()
+
+
+def _enqueue(conn, session_id: str, cwd: str, transcript_path: str) -> None:
+    cur = conn.execute(
+        "SELECT transcript_path, offset FROM sessions WHERE session_id=?", (session_id,)
+    ).fetchone()
+    if cur is not None and cur["transcript_path"] != transcript_path:
+        if cur["transcript_path"]:
+            conn.execute(
+                "INSERT INTO transcript_offsets(session_id, path, offset) VALUES(?,?,?) "
+                "ON CONFLICT(session_id, path) DO UPDATE SET offset=excluded.offset",
+                (session_id, cur["transcript_path"], cur["offset"]),
+            )
+        saved = conn.execute(
+            "SELECT offset FROM transcript_offsets WHERE session_id=? AND path=?",
+            (session_id, transcript_path),
+        ).fetchone()
+        if saved is not None:
+            # status 'done' com bytes novos é retomado por pipeline._pending; tentativas mantidas
+            conn.execute(
+                "UPDATE sessions SET transcript_path=?, offset=? WHERE session_id=?",
+                (transcript_path, saved["offset"], session_id),
+            )
+            return
     conn.execute(
         "INSERT INTO sessions(session_id, cwd, transcript_path, status, created_at) "
         "VALUES(?,?,?,'queued',?) "
@@ -152,12 +222,10 @@ def enqueue(conn, session_id: str, cwd: str, transcript_path: str) -> None:
         "transcript_path=excluded.transcript_path",
         (session_id, cwd, transcript_path, datetime.now().isoformat(timespec="seconds")),
     )
-    conn.commit()
 
 
 def reset_session(conn, session_id: str) -> bool:
-    """Reenfileira uma sessão (ex.: travada em 'error'), zerando tentativas. Retorna False
-    se a sessão não existir."""
+    """Devolve à fila uma sessão (ex.: em 'error' por tentativas esgotadas), mantendo o offset."""
     cur = conn.execute(
         "UPDATE sessions SET status='queued', attempts=0 WHERE session_id=?", (session_id,)
     )

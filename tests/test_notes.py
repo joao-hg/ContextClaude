@@ -6,8 +6,7 @@ from datetime import datetime
 from contextclaude import config, db, notes
 
 WHEN = datetime(2026, 10, 29, 12, 30)
-DATA = {"fatos": ["f1"], "decisoes": ["d1"], "pendencias": ["p1"],
-        "relacoes": [{"origem": "SQLite", "relacao": "guarda", "destino": "fila"}, "lixo"], "resumo": "res"}
+DATA = {"titulo": "Correção do índice", "resumo": "res", "feitos": ["Corrigimos o índice", 3]}
 
 
 class TestNotes(unittest.TestCase):
@@ -18,17 +17,32 @@ class TestNotes(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def test_session_note_has_wikilinks_and_sections(self):
-        text = notes.write_session_note("app", "s1", WHEN, DATA).read_text(encoding="utf-8")
-        self.assertIn("[[sqlite|SQLite]]", text)
-        self.assertIn("[[fila|fila]]", text)
-        for sec in ("## Resumo", "## Decisões", "## Fatos", "## Pendências", "## Relações"):
-            self.assertIn(sec, text)
+    def test_session_note_named_by_title_with_summary_and_done_items(self):
+        p = notes.write_session_note("app", "s1", WHEN, DATA)
+        self.assertEqual(p.name, "2026-10-29 Correção do índice.md")
+        text = p.read_text(encoding="utf-8")
+        self.assertIn("# Correção do índice", text)
+        self.assertIn("## Resumo\nres", text)
+        self.assertIn("## O que fizemos\n- Corrigimos o índice\n", text)
+        for sec in ("## Decisões", "## Fatos", "## Pendências", "## Relações"):
+            self.assertNotIn(sec, text)
 
-    def test_collision_gets_suffix(self):
+    def test_collision_with_other_session_gets_suffix_same_session_overwrites(self):
         a = notes.write_session_note("app", "s1", WHEN, DATA)
         b = notes.write_session_note("app", "s2", WHEN, DATA)
-        self.assertEqual(b.name, a.stem + "-2.md")
+        self.assertEqual(b.name, "2026-10-29 Correção do índice (2).md")
+        self.assertEqual(notes.write_session_note("app", "s1", WHEN, DATA), a)
+        self.assertEqual(len(list(a.parent.glob("*.md"))), 2)
+
+    def test_title_change_replaces_old_note(self):
+        a = notes.write_session_note("app", "s1", WHEN, DATA)
+        b = notes.write_session_note("app", "s1", WHEN, dict(DATA, titulo="Outro: título/novo"), old_path=str(a))
+        self.assertEqual(b.name, "2026-10-29 Outro título novo.md")
+        self.assertFalse(a.exists())
+
+    def test_missing_title_falls_back_to_session_id(self):
+        p = notes.write_session_note("app", "abcdef123456", WHEN, {"resumo": "x"})
+        self.assertEqual(p.name, "2026-10-29 Sessão abcdef12.md")
 
     def test_summary_roundtrip(self):
         notes.write_summary("app", "olá")
@@ -79,14 +93,66 @@ class TestNotes(unittest.TestCase):
         self.assertIn(f"[[{p.stem}|src/cc.py]]", text)
         self.assertIn(f"[[{c_sharp_path.stem}|C#]]", text)
 
-    def test_session_note_relation_links_resolve_to_entity_filenames(self):
-        data = {"relacoes": [{"origem": "src/cc.py", "relacao": "importa", "destino": "C#"}]}
-        p = notes.write_session_note("app", "s1", WHEN, data)
-        text = p.read_text(encoding="utf-8")
-        origem_page = notes.write_entity_note("app", "src/cc.py", "src/cc.py", [])
-        destino_page = notes.write_entity_note("app", "c#", "C#", [])
-        self.assertIn(f"[[{origem_page.stem}|src/cc.py]]", text)
-        self.assertIn(f"[[{destino_page.stem}|C#]]", text)
+    def test_write_session_from_db_removes_legacy_notes_and_stores_path(self):
+        conn = db.connect()
+        try:
+            db.enqueue(conn, "s1", "C:/x", "t.jsonl")
+            legacy = notes._dir("app") / "Sessões" / "2026-10-29-1230.md"
+            legacy.parent.mkdir(parents=True)
+            legacy.write_text("---\nprojeto: app\nsessao: s1\n---\n\n## Resumo\nvelho\n\n## Decisões\n- d\n",
+                              encoding="utf-8")
+            other = legacy.with_name("2026-10-29-1231.md")
+            other.write_text("---\nprojeto: app\nsessao: s2\n---\n", encoding="utf-8")
+            self.assertEqual(notes.legacy_resumos("app", "s1"), ["velho"])
+            p = notes.write_session_from_db(conn, "app", "s1", DATA)
+            self.assertFalse(legacy.exists())
+            self.assertTrue(other.exists())
+            self.assertEqual(conn.execute("SELECT note_path FROM sessions").fetchone()[0], str(p))
+        finally:
+            conn.close()
+
+    def _context_db(self):
+        conn = db.connect()
+        conn.execute("INSERT INTO sessions(session_id, project, title, summary, created_at) "
+                     "VALUES('s1','p','Correção do índice','Arrumamos o Chroma.','2026-11-01T10:00:00')")
+        conn.execute("INSERT INTO facts(session_id, project, kind, text, created_at) VALUES"
+                     "('s1','p','decisao','usar sqlite','2026-11-01T10:00:00'),"
+                     "('s1','p','fato','o worker roda destacado','2026-11-01T10:00:00')")
+        conn.execute("INSERT INTO facts(session_id, project, kind, text, status, created_at) "
+                     "VALUES('s1','p','decisao','usar postgres','substituida','2026-11-01T10:00:00')")
+        conn.execute("INSERT INTO relations(session_id, project, source, relation, target) "
+                     "VALUES('s1','p','worker','usa','SQLite'),('s1','p','hook','usa','sqlite')")
+        conn.commit()
+        return conn
+
+    def test_context_has_overview_live_decisions_and_recent_sessions(self):
+        conn = self._context_db()
+        try:
+            notes.write_summary("p", "Projeto de memória.")
+            text = notes.write_context(conn, "p").read_text(encoding="utf-8")
+        finally:
+            conn.close()
+        self.assertIn("# Contexto do projeto: p", text)
+        self.assertIn("Projeto de memória.", text)
+        self.assertIn("- usar sqlite", text)
+        self.assertNotIn("usar postgres", text)
+        self.assertIn("- o worker roda destacado", text)
+        self.assertIn("2026-11-01 — **Correção do índice**: Arrumamos o Chroma.", text)
+        self.assertRegex(text, r"## Componentes mais citados\n(SQLite|sqlite), ")
+
+    def test_context_is_capped(self):
+        conn = self._context_db()
+        try:
+            for i in range(15):
+                conn.execute("INSERT INTO facts(session_id, project, kind, text) VALUES('s1','p','fato',?)",
+                             (f"fato {i} " + "x" * 400,))
+            conn.commit()
+            text = notes.build_context(conn, "p")
+        finally:
+            conn.close()
+        self.assertLessEqual(len(text), notes.CONTEXT_MAX)
+        self.assertIn("## Sessões recentes", text)
+        self.assertIn("usar sqlite", text)
 
     def test_write_entity_note_truncates_long_key_for_filename(self):
         long_name = "x" * 300
@@ -119,9 +185,20 @@ class TestNotes(unittest.TestCase):
         self.assertEqual(count, 1)
         session_files = list((config.vault() / "p" / "Sessões").glob("*.md"))
         self.assertEqual(len(session_files), 1)
-        self.assertIn("usar sqlite", session_files[0].read_text(encoding="utf-8"))
         self.assertTrue((config.vault() / "p" / "Entidades" / "sqlite.md").is_file())
+        self.assertIn("usar sqlite", notes.context_path("p").read_text(encoding="utf-8"))
         conn.close()
+
+    def test_rebuild_project_uses_session_record(self):
+        conn = self._context_db()
+        try:
+            conn.execute("""UPDATE sessions SET feitos='["Refizemos o índice"]'""")
+            conn.commit()
+            notes.rebuild_project(conn, "p")
+        finally:
+            conn.close()
+        p = config.vault() / "p" / "Sessões" / "2026-11-01 Correção do índice.md"
+        self.assertIn("- Refizemos o índice", p.read_text(encoding="utf-8"))
 
     def test_rebuild_project_is_idempotent(self):
         conn = db.connect()
@@ -141,7 +218,10 @@ class TestNotes(unittest.TestCase):
             "INSERT INTO facts(session_id, project, kind, text, created_at) VALUES('s1','p','decisao','usar sqlite','2026-01-01T10:00:00')"
         )
         conn.commit()
-        notes.write_session_note("p", "s1", datetime(2026, 1, 1, 10, 0), {"resumo": "RESUMO REAL LLM"})
+        legacy = config.vault() / "p" / "Sessões" / "2026-01-01-1000.md"
+        legacy.parent.mkdir(parents=True)
+        legacy.write_text("---\nprojeto: p\nsessao: s1\n---\n\n## Resumo\nRESUMO REAL LLM\n\n## Fatos\n- f\n",
+                          encoding="utf-8")
         notes.rebuild_project(conn, "p")
         files = list((config.vault() / "p" / "Sessões").glob("*.md"))
         self.assertEqual(len(files), 1)

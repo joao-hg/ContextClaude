@@ -10,7 +10,7 @@ from unittest import mock
 from contextclaude import db, hooks, notes, pipeline, transcript
 from contextclaude.redact import redact
 
-DATA = {"fatos": ["f"], "decisoes": ["d"], "pendencias": [], "relacoes": [], "resumo": "r"}
+DATA = {"fatos": ["f"], "decisoes": ["d"], "feitos": [], "relacoes": [], "resumo": "r"}
 
 
 def now():
@@ -80,19 +80,21 @@ class Base(unittest.TestCase):
 
 
 class TestPipelineFixes(Base):
-    def test_status_not_committed_until_after_merge(self):
+    def test_merge_runs_after_commit_outside_any_transaction(self):
+        """O merge (chamada lenta ao Ollama) roda no fim da rodada, com tudo já commitado:
+        não segura o write lock do SQLite."""
         self.transcript(self.tpath, "x")
         db.enqueue(self.conn, "s1", r"C:\dev\app", self.tpath)
         seen = []
 
         def merge(old, d):
             other = db.connect()
-            seen.append(other.execute("SELECT status FROM sessions").fetchone()[0])
+            seen.append((other.execute("SELECT status FROM sessions").fetchone()[0], self.conn.in_transaction))
             other.close()
             return "R"
 
         self.run_q(merge=merge)
-        self.assertEqual(seen, ["queued"])  # ainda não commitado durante merge
+        self.assertEqual(seen, [("done", False)])
         self.assertEqual(self.row()["status"], "done")  # commitado após as etapas
 
     def test_model_output_and_old_summary_are_redacted(self):
@@ -132,17 +134,27 @@ class TestPipelineFixes(Base):
         self.transcript(p2, "y")
         db.enqueue(self.conn, "s1", r"C:\dev\app", self.tpath)
         db.enqueue(self.conn, "s2", r"C:\dev\app", p2)
-        real = notes.write_session_note
+        real = pipeline._save
 
-        def flaky(project, sid, when, data):
-            if sid == "s1":
+        def flaky(conn, row, *a, **kw):
+            if row["session_id"] == "s1":
                 raise PermissionError("bloqueado")
-            return real(project, sid, when, data)
+            return real(conn, row, *a, **kw)
 
-        with mock.patch.object(notes, "write_session_note", flaky):
+        with mock.patch.object(pipeline, "_save", flaky):
             self.run_q()
         self.assertEqual(self.row("s2")["status"], "done")
         self.assertEqual(self.row("s1")["attempts"], 1)
+
+    def test_session_note_failure_keeps_facts_and_finishes_session(self):
+        """Fatos no SQLite são a fonte da verdade; a nota se reconstrói com `cc.py vault`.
+        Falha ao gravar a nota (ex.: Obsidian segurando o arquivo) não refaz a extração."""
+        self.transcript(self.tpath, "x")
+        db.enqueue(self.conn, "s1", r"C:\dev\app", self.tpath)
+        with mock.patch.object(notes, "write_session_note", side_effect=PermissionError("bloqueado")):
+            self.run_q()
+        self.assertEqual(self.row()["status"], "done")
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0], 2)
 
     def test_text_appended_during_run_is_processed_in_same_run(self):
         self.transcript(self.tpath, "um")
@@ -163,7 +175,7 @@ class TestPipelineFixes(Base):
         self.transcript(self.tpath, "um")
         with open(self.tpath, "a", encoding="utf-8") as f:
             f.write('{"type":"user","mess')
-        db.enqueue(self.conn, "s1", r"C:\devpp", self.tpath)
+        db.enqueue(self.conn, "s1", r"C:\dev\app", self.tpath)
         self.run_q()
         self.run_q()
         self.assertEqual(self.row()["status"], "done")
@@ -185,6 +197,18 @@ class TestDbFixes(Base):
         db.enqueue(self.conn, "s1", "c", "b.jsonl")
         r = self.row()
         self.assertEqual((r["status"], r["offset"], r["attempts"], r["transcript_path"]), ("queued", 0, 0, "b.jsonl"))
+
+    def test_enqueue_alternating_paths_restores_each_offset(self):
+        """Sessão retomada em worktree: hooks alternam entre dois JSONL com o mesmo id."""
+        db.enqueue(self.conn, "s1", "c", "a.jsonl")
+        self.conn.execute("UPDATE sessions SET status='done', offset=500, attempts=2")
+        db.enqueue(self.conn, "s1", "c", "b.jsonl")
+        self.conn.execute("UPDATE sessions SET offset=70")
+        db.enqueue(self.conn, "s1", "c", "a.jsonl")
+        r = self.row()
+        self.assertEqual((r["transcript_path"], r["offset"]), ("a.jsonl", 500))
+        db.enqueue(self.conn, "s1", "c", "b.jsonl")
+        self.assertEqual(self.row()["offset"], 70)
 
     def test_wal_enabled(self):
         self.assertEqual(self.conn.execute("PRAGMA journal_mode").fetchone()[0], "wal")

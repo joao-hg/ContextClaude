@@ -53,11 +53,17 @@ class TestHooks(unittest.TestCase):
         self.assertEqual((row[0], row[1]), ("queued", self.proj))
         self.assertEqual(len(self.spawned), 1)
 
-    def test_start_spawns_chibi_widget(self):
-        chibi_spawned = []
-        hooks.session_start(self.payload(), spawn=lambda: self.spawned.append(1),
-                            spawn_chibi=lambda: chibi_spawned.append(1))
-        self.assertEqual(len(chibi_spawned), 1)
+    def test_start_only_spawns_worker_process(self):
+        from unittest import mock
+        env = {k: v for k, v in os.environ.items() if k != "CONTEXTCLAUDE_NO_SPAWN"}
+        with (
+            mock.patch.dict(os.environ, env, clear=True),
+            mock.patch.object(hooks.subprocess, "Popen") as popen,
+        ):
+            hooks.session_start(self.payload())
+        self.assertEqual(popen.call_count, 1)
+        self.assertTrue(popen.call_args[0][0][1].endswith("worker.py"))
+        self.assertFalse(hasattr(hooks, "_spawn_chibi"))
 
     def test_end_enqueues_and_spawns(self):
         hooks.session_end(self.payload(), spawn=lambda: self.spawned.append(1))

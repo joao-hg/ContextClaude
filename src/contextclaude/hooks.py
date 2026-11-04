@@ -24,17 +24,6 @@ def _spawn_worker() -> None:
     )
 
 
-def _spawn_chibi() -> None:
-    if os.environ.get("CONTEXTCLAUDE_NO_SPAWN"):
-        return
-    widget = Path(__file__).resolve().parents[1] / "chibi_widget.py"
-    flags = 0x00000008 | 0x00000200 | 0x08000000  # DETACHED | NEW_PROCESS_GROUP | NO_WINDOW
-    subprocess.Popen(
-        [sys.executable, str(widget)], creationflags=flags, close_fds=True,
-        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-    )
-
-
 def _enqueue(payload: dict) -> None:
     sid = payload.get("session_id")
     if not sid:
@@ -115,7 +104,7 @@ def prompt_submit(payload: dict, search=None) -> str:
         return ""
 
 
-def session_start(payload: dict, spawn=_spawn_worker, spawn_chibi=_spawn_chibi) -> str:
+def session_start(payload: dict, spawn=_spawn_worker) -> str:
     recall = ""
     try:
         _enqueue(payload)
@@ -126,7 +115,6 @@ def session_start(payload: dict, spawn=_spawn_worker, spawn_chibi=_spawn_chibi) 
     except Exception as e:
         log(f"recall falhou: {e!r}")
     spawn()
-    spawn_chibi()
     return recall
 
 
