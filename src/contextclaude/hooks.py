@@ -3,7 +3,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from . import config, db, notes
+from . import activity, config, db, notes
 from .logutil import log
 from .project import project_name
 from .redact import redact
@@ -123,4 +123,5 @@ def session_end(payload: dict, spawn=_spawn_worker) -> None:
         _enqueue(payload)
     except Exception as e:
         log(f"enqueue falhou no end: {e!r}")
+    activity.record("Sessão encerrada; vou anotar em seguida")
     spawn()

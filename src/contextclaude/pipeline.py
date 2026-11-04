@@ -293,6 +293,7 @@ def _flush_summaries(pending: dict, merge, conn=None) -> None:
                 "decisoes": agg["decisoes"][-SUMMARY_INPUT_ITEMS:],
                 "resumo": agg["resumo"][-SUMMARY_INPUT_RESUMO:],
             }
+            activity.record(f"Atualizando o resumo de {project}")
             summary = _compute_summary(project, slim, merge)
             if summary:
                 notes.write_summary(project, summary[:SUMMARY_MAX])
@@ -341,8 +342,11 @@ def _process_one(conn, row, extract, now, pending_summaries: dict, consolidate=N
         return {"result": kind, "chars": done_off - offset, "fatos": f, "decisoes": d}
 
     try:
-        for chunk in _chunks([(redact(l), pos) for l, pos in items]):
+        chunks = _chunks([(redact(l), pos) for l, pos in items])
+        for n_chunk, chunk in enumerate(chunks, 1):
             _wait_app(sid)
+            if len(chunks) > 1:
+                activity.record(f"Anotando sessão de {project} (parte {n_chunk} de {len(chunks)})")
             chibi_status.write_status("pensando", sid)
             try:
                 data = redact_deep(_extract_resilient([l for l, _ in chunk], extract, sid))
@@ -392,6 +396,8 @@ def _process_one(conn, row, extract, now, pending_summaries: dict, consolidate=N
                 log(f"páginas de entidade não gravadas ({sid}): {e!r}")
             agg = _aggregate(parts)
             try:
+                if finished:
+                    activity.record(f"Escrevendo a nota da sessão de {project}")
                 record = _session_record(
                     conn, sid, project, (consolidate or ollama.consolidate_session) if finished else None)
                 if record is not None:
@@ -438,6 +444,8 @@ def process_queue(conn, extract=ollama.extract, merge=ollama.merge_summary, now=
     estimativa_s = chars_pendentes / throughput if throughput else None
     if rodada_aberta:
         chibi_status.write_rodada_inicio(inicio.isoformat(timespec="seconds"), estimativa_s, len(primeiro_batch))
+        n_ini = len(primeiro_batch)
+        activity.record(f"Começando a anotar {n_ini} {'sessão' if n_ini == 1 else 'sessões'}")
     falhas = []
     chars_total = fatos_total = decisoes_total = 0
     try:

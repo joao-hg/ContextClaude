@@ -10,7 +10,7 @@ from pathlib import Path
 
 sys.path.insert(0, "src")
 from app.api import Api
-from contextclaude import config, db
+from contextclaude import activity, config, db
 
 
 def _nosearch(*a, **k):
@@ -95,6 +95,11 @@ class TestApi(unittest.TestCase):
         self.assertEqual(api.approve(plan_msg["id"], plano["items"]), {"error": "Este plano já foi executado."})
         self.assertEqual(api.undo(res["batch_id"])["restored"], 1)
         self.assertTrue((d / "contrato.pdf").exists())
+        textos = [r["texto"] for r in activity.recent(10)]
+        self.assertIn("Organizando a pasta Downloads", textos)
+        self.assertIn("Plano pronto para Downloads: 1 arquivos", textos)
+        self.assertIn("Movi 1 arquivos em Downloads", textos)
+        self.assertIn("Desfiz a organização: 1 arquivos de volta", textos)
 
     def test_organize_blocked_folder_answers_reason(self):
         api = Api(emit=self.events.append, llm_json=self.fail, llm_stream=self.fail, search=_nosearch, run_async=False)

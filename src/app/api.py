@@ -249,10 +249,12 @@ class Api:
         def progress(done, n):
             ev(type="status", text=f"Classificando {done} de {n} arquivos…")
 
+        activity.record(f"Organizando a pasta {base.name}")
         progress(0, len(files))
         items = organizer.plan(files, lambda s, u: self._llm_json(s, u, organizer.PLAN_NUM_PREDICT, model), progress)
         content = {"folder": str(base), "items": items, "total": total, "batch_id": None}
         pid = appdb.add_message(conn, cid, "plan", json.dumps(content, ensure_ascii=False))
+        activity.record(f"Plano pronto para {base.name}: {len(items)} arquivos")
         ev(type="plan", message=appdb.get_message(conn, pid))
         n = len({i["dest"].split("/")[0] for i in items})
         extra = f" A pasta tem {total} arquivos; esta rodada cobre os primeiros {len(items)}." if total > len(items) else ""
@@ -288,6 +290,7 @@ class Api:
                 return {"error": str(e)}
             plan.update(batch_id=result["batch_id"], items=chosen, result=result)
             appdb.update_message(conn, msg["id"], json.dumps(plan, ensure_ascii=False))
+            activity.record(f"Movi {len(result['moved'])} arquivos em {Path(plan['folder']).name}", "ok")
             return result
 
     @_safe
@@ -308,4 +311,5 @@ class Api:
                 if isinstance(plan, dict) and plan.get("batch_id") == batch_id:
                     plan["undone"] = True
                     appdb.update_message(conn, r["id"], json.dumps(plan, ensure_ascii=False))
+            activity.record(f"Desfiz a organização: {result['restored']} arquivos de volta", "ok")
             return result

@@ -1,6 +1,7 @@
 import json
 import sys
 import urllib.error
+from unittest.mock import patch
 
 sys.path.insert(0, "src")
 from contextclaude import activity, config, db, pause, pipeline
@@ -133,3 +134,45 @@ class TestPipelineActivity:
     def test_no_pause_line_when_not_paused(self):
         pipeline._wait_app("s1")
         assert "Pausado enquanto você usa o app" not in self.texts()
+
+
+class TestLiveProgress:
+    """Etapas longas aparecem no log enquanto acontecem, não só ao terminar."""
+    setup_method = tp.TestPipeline.setUp
+    teardown_method = tp.TestPipeline.tearDown
+    transcript = tp.TestPipeline.transcript
+    extract = tp.TestPipeline.extract
+    run_q = tp.TestPipeline.run_q
+    status = tp.TestPipeline.status
+
+    def texts(self):
+        return [r["texto"] for r in activity.recent(50)]
+
+    def test_round_start_and_parts_recorded_in_order(self):
+        self.transcript("decidimos usar sqlite", "e tambem postgres")
+        db.enqueue(self.conn, "s1", r"C:\dev\app", self.tpath)
+        with patch.object(pipeline, "_chunks", lambda items: [[i] for i in items]):
+            self.run_q()
+        t = list(reversed(self.texts()))
+        assert t[0] == "Começando a anotar 1 sessão"
+        i = t.index("Anotando sessão de app (parte 1 de 2)")
+        assert i < t.index("Anotando sessão de app (parte 2 de 2)")
+        assert t.index("Escrevendo a nota da sessão de app") < t.index("Notas de app atualizadas")
+        assert t.index("Atualizando o resumo de app") < t.index("Resumo de app atualizado")
+
+    def test_single_part_has_no_part_line(self):
+        self.transcript("decidimos usar sqlite")
+        db.enqueue(self.conn, "s1", r"C:\dev\app", self.tpath)
+        self.run_q()
+        assert not any("parte" in x for x in self.texts())
+
+    def test_empty_session_does_not_announce_round(self):
+        db.enqueue(self.conn, "s1", r"C:\dev\app", "")
+        self.run_q()
+        assert not any(x.startswith("Começando") for x in self.texts())
+
+
+def test_session_end_records_queue_line():
+    from contextclaude import hooks
+    hooks.session_end({"session_id": "s1", "cwd": "C:/x", "transcript_path": ""}, spawn=lambda: None)
+    assert activity.recent(1)[0]["texto"] == "Sessão encerrada; vou anotar em seguida"
